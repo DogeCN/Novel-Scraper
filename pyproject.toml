@@ -1,0 +1,15 @@
+[project]
+name = "Novel-Scraper"
+version = "0.1.0"
+description = "Default template for PDM package"
+authors = [
+    {name = "DogeCN", email = "hark2009lbf@outlook.com"},
+]
+dependencies = ["beautifulsoup4>=4.14.3", "requests>=2.32.5", "rich>=14.3.2", "readchar>=4.2.1"]
+requires-python = "==3.12.*"
+readme = "README.md"
+license = {text = "MIT"}
+
+
+[tool.pdm]
+distribution = false
