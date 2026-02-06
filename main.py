@@ -117,8 +117,8 @@ class ChapterRangeSelector:
 
 class ConfirmationDialog:
     @staticmethod
-    def show_confirmation(title: str, message: str) -> bool:
-        menu = InteractiveMenu(title)
+    def show_confirmation(message: str) -> bool:
+        menu = InteractiveMenu()
         menu.add_item("确认 (Y)", True)
         menu.add_item("取消 (N)", False)
         console.print(f"[yellow]{message}[/yellow]\n")
@@ -146,6 +146,7 @@ def show_main_menu():
 
 
 base_url_template = "https://www.xpxs.net/index/{}"
+chapter_template = "https://www.xpxs.net/chapter/{}"
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -162,7 +163,8 @@ def fetch_page(url: str, retry: int = 3) -> str:
             return response.text
         except Exception as e:
             if attempt < retry - 1:
-                time.sleep(1)
+                console.print(f"[red]获取页面失败: {url}, 错误: {e}, 正在重试...[/red]")
+                time.sleep(0.1)
             else:
                 console.print(f"[red]获取页面失败: {url}, 错误: {e}[/red]")
                 raise
@@ -276,7 +278,7 @@ def search_novels(keyword: str):
         return []
 
 
-def clean_content(text: str, chapter_title: str = "") -> str:
+def clean_content(text: str, chapter_title: str) -> str:
     cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = re.sub(r"<[^>]*>", "", cleaned)
     # 需要批量剔除的内容正则
@@ -288,10 +290,8 @@ def clean_content(text: str, chapter_title: str = "") -> str:
     ]
     for pat in patterns:
         cleaned = re.sub(pat, "", cleaned)
-    if chapter_title:
-        title_pattern = rf"^\s*{re.escape(chapter_title)}\s*"
-        if re.match(title_pattern, cleaned, re.MULTILINE):
-            cleaned = re.sub(title_pattern, "", cleaned, flags=re.MULTILINE)
+    title_pattern = rf"^\s*{re.escape(chapter_title)}\s*"
+    cleaned = re.sub(title_pattern, "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"^\s+|\s+$", "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"^\s*[─=\*]{5,}\s*$", "", cleaned, flags=re.MULTILINE)
@@ -326,8 +326,6 @@ async def parse_chapter_content(
                     cleaned = clean_content(page_content, chapter_title)
                     if cleaned:
                         all_content.append(cleaned)
-                        if page_number > 1:
-                            console.print(f"\t- 继续获取第 {page_number} 页...")
                 next_button = soup.find("a", {"rel": "next"})
                 if next_button:
                     next_href = next_button.get("href", "")
@@ -338,7 +336,7 @@ async def parse_chapter_content(
                             else next_href
                         )
                         page_number += 1
-                        time.sleep(0.1)
+                        await asyncio.sleep(0.01)
                     else:
                         current_page = None
                 else:
@@ -346,12 +344,15 @@ async def parse_chapter_content(
             break
         except Exception as e:
             if attempt < retry - 1:
+                console.print(f"\t第 {page_number} 页获取失败, 正在重试... ({e})")
                 await asyncio.sleep(0.1)
             else:
                 console.print(f"\t第 {page_number} 页获取失败: {e}")
                 break
     combined_content = "\n\n".join(all_content)
+    chapter_title = re.sub(r"第\s*\d+\s*[章节回]\s*", "", chapter_title)
     formatted_title = f"第 {chapter_index} 章 {chapter_title}"
+    console.print(f"{formatted_title} - 获取完成, 共 {len(combined_content)} 字符")
     return f"{formatted_title}\n\n{combined_content}"
 
 
@@ -373,21 +374,20 @@ def get_pages_and_title(novel_id: str):
 
 
 async def scrape_novel(start_chapter: int, end_chapter: int, novel_title: str, pages):
-    # 只爬取用户选择的章节范围
-    # 先构建章节索引和url列表
-    chapters_to_scrape = []
+    # 先解析所有分页页面，获取真实章节URL和标题
+    chapters_all = []
     for page in pages:
-        for idx in range(page["start_chapter"], page["end_chapter"] + 1):
-            if start_chapter <= idx <= end_chapter:
-                chapters_to_scrape.append(
-                    {
-                        "index": idx,
-                        "title": f"第{idx}章",  # 标题可后续优化为真实标题
-                        "url": page["url"].replace(
-                            "index", f"chapter/{idx}"
-                        ),  # 构造章节url
-                    }
-                )
+        try:
+            html = fetch_page(page["url"])
+            page_chapters = parse_chapter_list(html, page["start_chapter"])
+            chapters_all.extend(page_chapters)
+            await asyncio.sleep(0.01)
+        except Exception as e:
+            console.print(f"[red]分页获取失败: {page['url']} {e}[/red]")
+    # 按用户选择范围筛选
+    chapters_to_scrape = [
+        c for c in chapters_all if start_chapter <= c["index"] <= end_chapter
+    ]
     if not chapters_to_scrape:
         console.print("[red]❌ 没有找到任何章节[/red]")
         return
@@ -402,11 +402,9 @@ async def scrape_novel(start_chapter: int, end_chapter: int, novel_title: str, p
         ]
     )
     with open(output_file, "w", encoding="utf-8") as f:
-        f.write(f"《{novel_title}》\n")
-        f.write(f"{'=' * 50}\n\n")
         success_count = 0
         fail_count = 0
-        for i, (_, content) in enumerate(zip(chapters_to_scrape, results)):
+        for i, content in enumerate(results):
             progress = f"[{i + 1}/{len(chapters_to_scrape)}]"
             if content.strip():
                 f.write("\n\n" + content)
@@ -437,7 +435,7 @@ if __name__ == "__main__":
                 continue
             results = search_novels(keyword)
             if not results:
-                console.print("[red]❌ 未找到相关小说[/red]\n按任意键继续...")
+                console.print("[red]❌ 未找到相关小说[/red]")
                 readchar.readkey()
                 continue
             selected = SearchResultSelector.show_search_results(results, keyword)
@@ -463,12 +461,9 @@ if __name__ == "__main__":
             continue
         global output_file
         output_file = f"novels/{re.sub(r'[<>:"/\\|?*]', "", novel_title)}_{start_chapter}-{end_chapter}.txt"
-        if not ConfirmationDialog.show_confirmation(
-            "确认开始爬取？", "按回车确认开始爬取,ESC 取消"
-        ):
+        if not ConfirmationDialog.show_confirmation("按回车确认开始爬取, ESC 取消"):
             console.print("[yellow]已取消[/yellow]")
             continue
         console.print()
         asyncio.run(scrape_novel(start_chapter, end_chapter, novel_title, pages))
-        console.print("\n[green]按任意键返回主菜单...[/green]")
         readchar.readkey()
