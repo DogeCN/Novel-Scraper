@@ -1,9 +1,8 @@
 import re
 import os
-import time
 import asyncio
 from typing import List, Dict
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
 import readchar
 from rich.console import Console
@@ -154,17 +153,21 @@ headers = {
 }
 
 
-def fetch_page(url: str, retry: int = 3) -> str:
+async def fetch_page_async(
+    url: str, session: aiohttp.ClientSession, retry: int = 3
+) -> str:
     for attempt in range(retry):
         try:
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            response.encoding = "utf-8"
-            return response.text
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as response:
+                response.raise_for_status()
+                text = await response.text(encoding="utf-8", errors="ignore")
+                return text
         except Exception as e:
             if attempt < retry - 1:
                 console.print(f"[red]获取页面失败: {url}, 错误: {e}, 正在重试...[/red]")
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
             else:
                 console.print(f"[red]获取页面失败: {url}, 错误: {e}[/red]")
                 raise
@@ -221,10 +224,10 @@ def parse_chapter_list(html: str, page_start_index: int):
     return chapters
 
 
-def search_novels(keyword: str):
+async def search_novels(keyword: str, session: aiohttp.ClientSession):
     search_url = f"https://www.xpxs.net/search/?searchkey={keyword}"
     try:
-        html = fetch_page(search_url)
+        html = await fetch_page_async(search_url, session)
         soup = BeautifulSoup(html, "html.parser")
         results = []
         dl_elements = soup.find_all("dl")
@@ -287,6 +290,7 @@ def clean_content(text: str, chapter_title: str) -> str:
         r"本章未完.*?下一页.*?阅读[。]?",
         r"章节报错.*?免登录[。]?",
         r".*?请大家收藏.*?更新速度.*?最快[。]?",
+        r".*?后面还有哦.*?后面更精彩.*?",
     ]
     for pat in patterns:
         cleaned = re.sub(pat, "", cleaned)
@@ -299,7 +303,11 @@ def clean_content(text: str, chapter_title: str) -> str:
 
 
 async def parse_chapter_content(
-    chapter_index: int, chapter_title: str, chapter_url: str, retry: int = 3
+    chapter_index: int,
+    chapter_title: str,
+    chapter_url: str,
+    session: aiohttp.ClientSession,
+    retry: int = 3,
 ) -> str:
     all_content = []
     current_page = chapter_url
@@ -307,7 +315,7 @@ async def parse_chapter_content(
     for attempt in range(retry):
         try:
             while current_page:
-                html = fetch_page(current_page)
+                html = await fetch_page_async(current_page, session)
                 soup = BeautifulSoup(html, "html.parser")
                 content_selectors = [
                     "#booktxt",
@@ -356,10 +364,10 @@ async def parse_chapter_content(
     return f"{formatted_title}\n\n{combined_content}"
 
 
-def get_pages_and_title(novel_id: str):
+async def get_pages_and_title(novel_id: str, session: aiohttp.ClientSession):
     base_url = base_url_template.format(novel_id)
     console.print("[yellow]正在获取分页信息...[/yellow]\n")
-    first_page_html = fetch_page(f"{base_url}/")
+    first_page_html = await fetch_page_async(f"{base_url}/", session)
     pages, novel_title = extract_page_info(first_page_html, novel_id)
     if not pages:
         console.print("[red]❌ 未找到分页信息,请检查小说ID是否正确[/red]")
@@ -373,17 +381,28 @@ def get_pages_and_title(novel_id: str):
     return pages, novel_title
 
 
-async def scrape_novel(start_chapter: int, end_chapter: int, novel_title: str, pages):
+async def scrape_novel(
+    start_chapter: int,
+    end_chapter: int,
+    pages,
+    session: aiohttp.ClientSession,
+):
     # 先解析所有分页页面，获取真实章节URL和标题
     chapters_all = []
-    for page in pages:
+
+    async def fetch_page_chapters(page):
         try:
-            html = fetch_page(page["url"])
-            page_chapters = parse_chapter_list(html, page["start_chapter"])
-            chapters_all.extend(page_chapters)
-            await asyncio.sleep(0.01)
+            html = await fetch_page_async(page["url"], session)
+            return parse_chapter_list(html, page["start_chapter"])
         except Exception as e:
             console.print(f"[red]分页获取失败: {page['url']} {e}[/red]")
+            return []
+
+    page_chapters_list = await asyncio.gather(
+        *[fetch_page_chapters(page) for page in pages]
+    )
+    for page_chapters in page_chapters_list:
+        chapters_all.extend(page_chapters)
     # 按用户选择范围筛选
     chapters_to_scrape = [
         c for c in chapters_all if start_chapter <= c["index"] <= end_chapter
@@ -397,7 +416,7 @@ async def scrape_novel(start_chapter: int, end_chapter: int, novel_title: str, p
         os.makedirs(output_dir)
     results = await asyncio.gather(
         *[
-            parse_chapter_content(chap["index"], chap["title"], chap["url"])
+            parse_chapter_content(chap["index"], chap["title"], chap["url"], session)
             for chap in chapters_to_scrape
         ]
     )
@@ -416,54 +435,62 @@ async def scrape_novel(start_chapter: int, end_chapter: int, novel_title: str, p
                 fail_count += 1
     console.print()
     console.print(
-        f"[bold green]✓ 爬取完成![/bold green]\n\n成功: [green]{success_count}[/green] 章\n失败: [red]{fail_count}[/red] 章\n文件: [cyan]{output_file}[/cyan]",
+        f"[bold green]✓ 爬取完成![/bold green]\n",
+    )
+    console.print(
+        f"成功: [green]{success_count}[/green] 章\n失败: [red]{fail_count}[/red] 章\n文件: [cyan]{output_file}[/cyan]"
     )
 
 
-if __name__ == "__main__":
-    while True:
-        choice = show_main_menu()
-        if not choice or choice == "exit":
-            console.print("[yellow]👋 再见![/yellow]")
-            break
-        novel_id = novel_title = ""
-        if choice == "search":
-            console.print("\n[cyan]请输入搜索关键词:[/cyan] ", end="")
-            keyword = input().strip()
-            if not keyword:
-                console.print("[red]❌ 搜索关键词不能为空![/red]")
-                continue
-            results = search_novels(keyword)
-            if not results:
-                console.print("[red]❌ 未找到相关小说[/red]")
+async def main():
+    async with aiohttp.ClientSession() as session:
+        while True:
+            choice = show_main_menu()
+            if not choice or choice == "exit":
+                console.print("[yellow]👋 再见![/yellow]")
+                break
+            novel_id = novel_title = ""
+            if choice == "search":
+                console.print("\n[cyan]请输入搜索关键词:[/cyan] ", end="")
+                keyword = input().strip()
+                if not keyword:
+                    console.print("[red]❌ 搜索关键词不能为空![/red]")
+                    continue
+                results = await search_novels(keyword, session)
+                if not results:
+                    console.print("[red]❌ 未找到相关小说[/red]")
+                    readchar.readkey()
+                    continue
+                selected = SearchResultSelector.show_search_results(results, keyword)
+                if not selected:
+                    continue
+                novel_id = selected["id"]
+                novel_title = selected["title"]
+            elif choice == "input":
+                console.print("\n[cyan]请输入小说ID:[/cyan] ", end="")
+                novel_id = input().strip()
+                if not novel_id:
+                    console.print("[red]❌ 小说ID不能为空![/red]")
+                    continue
+            pages, novel_title = await get_pages_and_title(novel_id, session)
+            if not pages:
+                console.print("[red]❌ 无法获取章节信息,请检查小说ID[/red]")
                 readchar.readkey()
                 continue
-            selected = SearchResultSelector.show_search_results(results, keyword)
-            if not selected:
+            start_chapter, end_chapter = ChapterRangeSelector.show_range_selector(
+                max(page["end_chapter"] for page in pages)
+            )
+            if not start_chapter or not end_chapter:
                 continue
-            novel_id = selected["id"]
-            novel_title = selected["title"]
-        elif choice == "input":
-            console.print("\n[cyan]请输入小说ID:[/cyan] ", end="")
-            novel_id = input().strip()
-            if not novel_id:
-                console.print("[red]❌ 小说ID不能为空![/red]")
+            global output_file
+            output_file = f"novels/{re.sub(r'[<>:\"/\\|?*]', '', novel_title)}_{start_chapter}-{end_chapter}.txt"
+            if not ConfirmationDialog.show_confirmation("按回车确认开始爬取, ESC 取消"):
+                console.print("[yellow]已取消[/yellow]")
                 continue
-        pages, novel_title = get_pages_and_title(novel_id)
-        if not pages:
-            console.print("[red]❌ 无法获取章节信息,请检查小说ID[/red]")
+            console.print()
+            await scrape_novel(start_chapter, end_chapter, pages, session)
             readchar.readkey()
-            continue
-        start_chapter, end_chapter = ChapterRangeSelector.show_range_selector(
-            max(page["end_chapter"] for page in pages)
-        )
-        if not start_chapter or not end_chapter:
-            continue
-        global output_file
-        output_file = f"novels/{re.sub(r'[<>:"/\\|?*]', "", novel_title)}_{start_chapter}-{end_chapter}.txt"
-        if not ConfirmationDialog.show_confirmation("按回车确认开始爬取, ESC 取消"):
-            console.print("[yellow]已取消[/yellow]")
-            continue
-        console.print()
-        asyncio.run(scrape_novel(start_chapter, end_chapter, novel_title, pages))
-        readchar.readkey()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
