@@ -361,7 +361,7 @@ async def parse_chapter_content(
     chapter_title = re.sub(r"第\s*\d+\s*[章节回]\s*", "", chapter_title)
     formatted_title = f"第 {chapter_index} 章 {chapter_title}"
     console.print(f"{formatted_title} - 获取完成, 共 {len(combined_content)} 字符")
-    return f"{formatted_title}\n\n{combined_content}"
+    return f"{formatted_title}\n{combined_content}"
 
 
 async def get_pages_and_title(novel_id: str, session: aiohttp.ClientSession):
@@ -426,7 +426,7 @@ async def scrape_novel(
         for i, content in enumerate(results):
             progress = f"[{i + 1}/{len(chapters_to_scrape)}]"
             if content.strip():
-                f.write("\n\n" + content)
+                f.write(content + "\n\n")
                 f.flush()
                 ProgressBar.show_success(f"{progress} 已写入文件 ({len(content)} 字符)")
                 success_count += 1
